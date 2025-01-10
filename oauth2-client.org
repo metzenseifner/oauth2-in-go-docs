@@ -1,0 +1,238 @@
+* Oauth2 Client Lib
+  package oauth2 // import "golang.org/x/oauth2"
+
+The imports from the package
+#+BEGIN_SRC go
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/oauth2/internal"
+)
+#+END_SRC
+
+** Creating HTTP Client Objects
+
+NewClient creates an *http.Client from a Context and TokenSource.
+As a special case, if src is nil, a non-OAuth2 client is returned using the
+   provided context. This exists to support related OAuth2 packages.
+
+#+BEGIN_SRC go
+func NewClient(ctx context.Context, src TokenSource) *http.Client {
+	if src == nil {
+		return internal.ContextClient(ctx)
+	}
+	return &http.Client{
+		Transport: &Transport{
+			Base:   internal.ContextClient(ctx).Transport,
+			Source: ReuseTokenSource(nil, src),
+		},
+	}
+}
+#+END_SRC
+
+*** Things involved
+- The *Context* type (from the package
+      https://pkg.go.dev/golang.org/x/net/context): carries deadlines,
+      cancelation signals, and other request-scoped values across API
+      boundaries and between processes. Its methods are safe for simultaneous
+      use by multiple goroutines. Note it is possible use context.TODO if you
+      are unsure about which Context to use.
+
+#+BEGIN_SRC go
+type Context interface {
+    // Done returns a channel that is closed when this Context is canceled
+    // or times out. Signal for cancelation.
+    Done() <-chan struct{}
+
+    // Err indicates why this context was canceled, after the Done channel
+    // is closed.
+    Err() error
+
+    // Deadline returns the time when this Context will be canceled, if any.
+    Deadline() (deadline time.Time, ok bool)
+
+    // Value returns the value associated with key or nil if none.
+    Value(key interface{}) interface{}
+}
+#+END_SRC
+
+
+** Implementing Token Sources
+
+
+
+#+BEGIN_SRC
+type TokenSource interface {
+	// Token returns a token or an error.
+	// Token must be safe for concurrent use by multiple goroutines.
+	// The returned Token must not be modified.
+	Token() (*Token, error)
+}
+#+END_SRC
+
+*** Things involved
+- *Abstraction Type: TokenSource*
+- refresh token
+- access token
+- token constructor
+
+~Token~ represents the credentials used to authorize
+the requests to access protected resources on the OAuth 2.0
+provider's backend i.e. an *access token*. It also contains a *refresh token*.
+#+BEGIN_SRC go
+type Token struct {
+	// AccessToken is the token that authorizes and authenticates
+	// the requests.
+	AccessToken string `json:"access_token"`
+
+	// TokenType is the type of token.
+	// The Type method returns either this or "Bearer", the default.
+	TokenType string `json:"token_type,omitempty"`
+
+	// RefreshToken is a token that's used by the application
+	// (as opposed to the user) to refresh the access token
+	// if it expires.
+	RefreshToken string `json:"refresh_token,omitempty"`
+
+	// Expiry is the optional expiration time of the access token.
+	//
+	// If zero, TokenSource implementations will reuse the same
+	// token forever and RefreshToken or equivalent
+	// mechanisms for that TokenSource will not be used.
+	Expiry time.Time `json:"expiry,omitempty"`
+
+	// ExpiresIn is the OAuth2 wire format "expires_in" field,
+	// which specifies how many seconds later the token expires,
+	// relative to an unknown time base approximately around "now".
+	// It is the application's responsibility to populate
+	// `Expiry` from `ExpiresIn` when required.
+	ExpiresIn int64 `json:"expires_in,omitempty"`
+
+	// raw optionally contains extra metadata from the server
+	// when updating a token.
+	raw interface{}
+
+	// expiryDelta is used to calculate when a token is considered
+	// expired, by subtracting from Expiry. If zero, defaultExpiryDelta
+	// is used.
+	expiryDelta time.Duration
+}
+#+END_SRC
+
+The Token (defined in token.go) has a predicate function to determine its validity.
+Requirements for a valid token:
+1. Token must not be nil/void/null.
+2. Token must not be empty string.
+3. Token must not be older than its expiration date.
+
+#+BEGIN_SRC go
+func (t *Token) Valid() bool {
+	return t != nil && t.AccessToken != "" && !t.expired()
+}
+#+END_SRC
+
+The ~expired~ predicate function used by ~valid()~.
+It compares the expiration timestamp with the current time, ensuring that it is
+    still earlier than the current time.
+
+#+BEGIN_SRC go
+func (t *Token) expired() bool {
+	if t.Expiry.IsZero() {
+		return false
+	}
+
+	expiryDelta := defaultExpiryDelta
+	if t.expiryDelta != 0 {
+		expiryDelta = t.expiryDelta
+	}
+	return t.Expiry.Round(0).Add(-expiryDelta).Before(timeNow())
+}
+#+END_SRC
+
+A auto-renewable Token constructor
+#+BEGIN_SRC go
+func (s *reuseTokenSource) Token() (*Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.t.Valid() {
+		return s.t, nil
+	}
+	t, err := s.new.Token()
+	if err != nil {
+		return nil, err
+	}
+	t.expiryDelta = s.expiryDelta
+	s.t = t
+	return t, nil
+}
+#+END_SRC
+
+compare to a static Token constructor
+
+#+BEGIN_SRC
+func (s staticTokenSource) Token() (*Token, error) {
+	return s.t, nil
+}
+#+END_SRC
+
+*** Auto-renewable Token Sources
+The most useful token source is an automatically-renewing token that keeps
+    track of the expiration timestamp and renews the access token when
+    necessary in the background. This implemention allows full control of when
+    an access tokens should expire by allowing the caller to override the
+    expiration timestamp.
+
+
+#+BEGIN_SRC go
+func ReuseTokenSourceWithExpiry(t *Token, src TokenSource, earlyExpiry time.Duration) TokenSource {
+	// Don't wrap a reuseTokenSource in itself. That would work,
+	// but cause an unnecessary number of mutex operations.
+	// Just build the equivalent one.
+	if rt, ok := src.(*reuseTokenSource); ok {
+		if t == nil {
+			// Just use it directly, but set the expiryDelta to earlyExpiry,
+			// so the behavior matches what the user expects.
+			rt.expiryDelta = earlyExpiry
+			return rt
+		}
+		src = rt.new
+	}
+	if t != nil {
+		t.expiryDelta = earlyExpiry
+	}
+	return &reuseTokenSource{
+		t:           t,
+		new:         src,
+		expiryDelta: earlyExpiry,
+	}
+}
+#+END_SRC
+
+
+The second auto-renewable functionis
+
+#+BEGIN_SRC go
+func ReuseTokenSource(t *Token, src TokenSource) TokenSource {
+	// Don't wrap a reuseTokenSource in itself. That would work,
+	// but cause an unnecessary number of mutex operations.
+	// Just build the equivalent one.
+	if rt, ok := src.(*reuseTokenSource); ok {
+		if t == nil {
+			// Just use it directly.
+			return rt
+		}
+		src = rt.new
+	}
+	return &reuseTokenSource{
+		t:   t,
+		new: src,
+	}
+}
+#+END_SRC
